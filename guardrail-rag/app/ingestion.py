@@ -8,6 +8,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 from app.database import add_document_chunk, create_tables
+from app.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def load_pdf_text(pdf_path: str) -> str:
@@ -59,12 +62,15 @@ def embed_text(text: str, dimension: int = 1536) -> List[float]:
     norm = sum(value * value for value in vector) ** 0.5
     if norm == 0:
         return [0.0] * dimension
-    return [value / norm for value in vector]
+    emb = [value / norm for value in vector]
+    logger.debug("embed_text: built embedding len=%d for text len=%d", len(emb), len(text))
+    return emb
 
 
 def store_chunks(chunks: List[str], metadata: Dict[str, Any] | None = None) -> None:
     create_tables()
     metadata = metadata or {}
+    logger.info("store_chunks: storing %d chunks (metadata keys=%s)", len(chunks), list(metadata.keys()))
     for chunk in chunks:
         embedding = embed_text(chunk)
         add_document_chunk(chunk, metadata=metadata, embedding=embedding)

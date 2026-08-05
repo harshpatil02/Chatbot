@@ -5,19 +5,13 @@ import re
 from typing import Any, Dict, List
 
 from app.database import get_connection
+from app.logging_config import get_logger
 
-try:
-    from flashrank import Ranker
-except Exception:  # pragma: no cover - optional dependency
-    Ranker = None
-
+logger = get_logger(__name__)
 try:
     import bm25s
 except Exception:  # pragma: no cover - optional dependency
     bm25s = None
-
-
-ranker: Any | None = None
 
 
 def _tokenize(text: str) -> List[str]:
@@ -29,7 +23,9 @@ def lexical_similarity(query: str, text: str) -> float:
     text_terms = set(_tokenize(text))
     if not query_terms:
         return 0.0
-    return len(query_terms & text_terms) / len(query_terms)
+    score = len(query_terms & text_terms) / len(query_terms)
+    logger.debug("lexical_similarity computed: query_terms=%d intersection=%d score=%s", len(query_terms), len(query_terms & text_terms), score)
+    return score
 
 
 def _cosine_similarity(left: List[float], right: List[float]) -> float:
@@ -41,7 +37,9 @@ def _cosine_similarity(left: List[float], right: List[float]) -> float:
     right_norm = math.sqrt(sum(value * value for value in right))
     if left_norm == 0 or right_norm == 0:
         return 0.0
-    return dot_product / (left_norm * right_norm)
+    result = dot_product / (left_norm * right_norm)
+    logger.debug("cosine similarity: %s", result)
+    return result
 
 
 def _build_embedding(text: str, dimension: int = 1536) -> List[float]:
@@ -53,20 +51,10 @@ def _build_embedding(text: str, dimension: int = 1536) -> List[float]:
     norm = math.sqrt(sum(value * value for value in vector))
     if norm == 0:
         return [0.0] * dimension
-    return [value / norm for value in vector]
+    emb = [value / norm for value in vector]
+    logger.debug("built embedding for text(len=%d), dim=%d", len(text), len(emb))
+    return emb
 
-
-def _get_ranker() -> Any | None:
-    global ranker
-    if ranker is not None:
-        return ranker
-    if Ranker is None:
-        return None
-    try:
-        ranker = Ranker(model_name="ms-marco-MiniLM-L-6-v2")
-    except Exception:  # pragma: no cover - dependency/version differences
-        ranker = None
-    return ranker
 
 
 def _bm25_score(query: str, text: str, document_frequency: Dict[str, int], average_document_length: float, total_documents: int) -> float:
@@ -111,6 +99,7 @@ def bm25_search(query: str, documents: List[Dict[str, Any]], top_k: int = 10) ->
             for document, score in zip(documents, scores):
                 scored.append({**document, "score": float(score), "bm25_score": float(score)})
             scored.sort(key=lambda item: item["score"], reverse=True)
+            logger.info("bm25_search: used bm25s lib, returning %d results", min(len(scored), top_k))
             return scored[:top_k]
         except Exception:
             pass
@@ -127,6 +116,7 @@ def bm25_search(query: str, documents: List[Dict[str, Any]], top_k: int = 10) ->
         scored.append({**document, "score": score, "bm25_score": score})
 
     scored.sort(key=lambda item: item["score"], reverse=True)
+    logger.info("bm25_search: used fallback bm25, returning %d results", min(len(scored), top_k))
     return scored[:top_k]
 
 
@@ -148,6 +138,7 @@ def rrf_rerank(*ranked_lists: List[Dict[str, Any]], top_k: int = 5, rank_constan
 
     reranked = [dict(item) for item in scores.values()]
     reranked.sort(key=lambda item: item["score"], reverse=True)
+    logger.info("rrf_rerank: combined %d lists -> %d results (top_k=%d)", len(ranked_lists), len(reranked), top_k)
     return reranked[:top_k]
 
 
@@ -172,9 +163,11 @@ def hybrid_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
             pass
 
     if not rows:
+        logger.info("hybrid_search: no rows found in document_chunks")
         return []
 
     query_embedding = _build_embedding(query)
+    logger.info("hybrid_search: running hybrid search for query=%r top_k=%d", query, top_k)
     lexical_results: List[Dict[str, Any]] = []
     vector_results: List[Dict[str, Any]] = []
     documents = []
@@ -194,7 +187,20 @@ def hybrid_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
 
     lexical_results.sort(key=lambda item: item["lexical_score"], reverse=True)
     vector_results.sort(key=lambda item: item["vector_score"], reverse=True)
+    # Log top lexical and vector candidates
+    try:
+        top_lexical = [(item["id"], item["lexical_score"], item["content"][:120]) for item in lexical_results[:5]]
+        top_vector = [(item["id"], item["vector_score"], item["content"][:120]) for item in vector_results[:5]]
+        logger.info("hybrid_search: top lexical candidates: %s", top_lexical)
+        logger.info("hybrid_search: top vector candidates: %s", top_vector)
+    except Exception:
+        logger.debug("hybrid_search: failed to log top lexical/vector candidates")
     bm25_results = bm25_search(query, documents, top_k=10)
+    try:
+        top_bm25 = [(item.get("id"), item.get("bm25_score"), item.get("content", "")[:120]) for item in bm25_results[:5]]
+        logger.info("hybrid_search: top bm25 candidates: %s", top_bm25)
+    except Exception:
+        logger.debug("hybrid_search: failed to log top bm25 candidates")
 
     combined = rrf_rerank(
         lexical_results[:10],
@@ -202,6 +208,13 @@ def hybrid_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         bm25_results,
         top_k=top_k,
     )
+    logger.debug("hybrid_search: lexical top %d, vector top %d, bm25 top %d", len(lexical_results[:10]), len(vector_results[:10]), len(bm25_results))
+
+    try:
+        combined_summary = [(item.get("id"), item.get("score"), item.get("bm25_score", 0.0), item.get("vector_score", 0.0), item.get("lexical_score", 0.0)) for item in combined]
+        logger.info("hybrid_search: combined candidates (after RRF): %s", combined_summary)
+    except Exception:
+        logger.debug("hybrid_search: failed to log combined candidates")
 
     scored = []
     for item in combined:
@@ -218,28 +231,36 @@ def hybrid_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         )
 
     scored.sort(key=lambda entry: entry["score"], reverse=True)
-    return scored[:top_k]
+    final = scored[:top_k]
+    try:
+        final_summary = [(item.get("id"), item.get("score"), item.get("bm25_score"), item.get("vector_score"), item.get("lexical_score")) for item in final]
+        logger.info("hybrid_search: final top_k docs: %s", final_summary)
+    except Exception:
+        logger.debug("hybrid_search: failed to log final top_k docs")
+    return final
 
 
 def rerank_documents(query: str, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not documents:
         return []
 
-    ranker = _get_ranker()
-    if ranker is None:
-        scored = []
-        for document in documents:
-            lexical_score = lexical_similarity(query, document["content"])
-            scored.append({**document, "reranked_score": lexical_score + (document.get("score", 0.0) / 10.0)})
-        scored.sort(key=lambda item: item["reranked_score"], reverse=True)
-        return scored
+    logger.info("rerank_documents: received %d documents for query=%r", len(documents), query)
+    try:
+        input_summary = [(doc.get("id"), doc.get("score", 0.0)) for doc in documents[:10]]
+        logger.debug("rerank_documents: input sample=%s", input_summary)
+    except Exception:
+        logger.debug("rerank_documents: failed to log input sample")
+
+    scored = []
+    for document in documents:
+        lexical_score = lexical_similarity(query, document["content"])
+        scored.append({**document, "reranked_score": lexical_score + (document.get("score", 0.0) / 10.0)})
+    scored.sort(key=lambda item: item["reranked_score"], reverse=True)
 
     try:
-        pairs = [(query, document["content"]) for document in documents]
-        ranked = ranker.rank(pairs) if hasattr(ranker, "rank") else []
-        reranked = []
-        for document in documents:
-            reranked.append({**document, "reranked_score": document.get("score", 0.0)})
-        return reranked
-    except Exception:  # pragma: no cover
-        return documents
+        output_summary = [(doc.get("id"), doc.get("reranked_score")) for doc in scored[:10]]
+        logger.info("rerank_documents: output top sample=%s", output_summary)
+    except Exception:
+        logger.debug("rerank_documents: failed to log output sample")
+
+    return scored

@@ -8,6 +8,9 @@ from psycopg.rows import dict_row
 from sqlalchemy import JSON, Column, Index, Integer, String, Text, create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from app.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 try:
     import psycopg2  # noqa: F401
@@ -89,9 +92,11 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS hnsw_index_document_chunks_embedding ON document_chunks USING hnsw (embedding vector_cosine_ops)"
             )
         )
+    logger.info("init_db: ensured vector extension and hnsw index exist")
 
 
 def get_connection() -> Any:
+    logger.debug("get_connection: connecting to database URL from get_database_url()")
     return psycopg.connect(get_database_url(), row_factory=dict_row)
 
 
@@ -106,4 +111,5 @@ def add_document_chunk(content: str, *, metadata: dict[str, Any] | None = None, 
         session.add(chunk)
         session.commit()
         session.refresh(chunk)
+        logger.info("add_document_chunk: added chunk id=%s content_len=%d", chunk.id, len(content))
         return chunk

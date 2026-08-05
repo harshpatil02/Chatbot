@@ -5,6 +5,9 @@ import re
 from typing import Any, Dict, List, TypedDict
 
 from app.llm import call_llm
+from app.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 try:
     from langgraph.graph import END, StateGraph
@@ -49,10 +52,12 @@ def guardrail_check(query: str) -> tuple[bool, str]:
         "Reply only with JSON: {\"safe\": true|false, \"blocked\": true|false, \"reason\": \"brief explanation\"}"
     )
     user_prompt = f"User query: {query}"
+    logger.info("guardrail_check: checking query=%r", query)
     llm_result = call_llm(system_prompt, user_prompt)
     parsed = _parse_guardrail_result(llm_result)
     if parsed is not None:
         blocked, reason = parsed
+        logger.info("guardrail_check: llm parsed result blocked=%s reason=%s", blocked, reason)
         if blocked:
             return True, reason
         return False, ""
@@ -76,6 +81,7 @@ def guardrail_node(state: AgentState) -> AgentState:
     if blocked:
         state["answer"] = "I can't assist with requests that try to bypass safeguards or involve sensitive personal data."
         state["error"] = reason
+        logger.warning("guardrail_node: blocked query=%r reason=%s", state.get("query", ""), reason)
     return state
 
 
@@ -85,8 +91,15 @@ def retrieve_node(state: AgentState) -> AgentState:
     if state.get("blocked"):
         return state
 
+    logger.info("retrieve_node: retrieving documents for query=%r", state.get("query", ""))
     docs = hybrid_search(state.get("query", ""), top_k=5)
     state["documents"] = rerank_documents(state.get("query", ""), docs)
+    logger.info("retrieve_node: retrieved %d documents", len(state.get("documents", [])))
+    try:
+        sample = [(doc.get("id"), doc.get("reranked_score", doc.get("score", 0.0)), doc.get("content", "")[:120]) for doc in state.get("documents", [])[:5]]
+        logger.info("retrieve_node: documents details: %s", sample)
+    except Exception:
+        logger.debug("retrieve_node: failed to log document details")
     return state
 
 
@@ -108,6 +121,8 @@ def auditor_node(state: AgentState) -> AgentState:
             citations.append({"id": doc_id, "content": content[:400]})
             context_blocks.append(f"[Document {index}]\n{content}")
 
+    logger.info("auditor_node: prepared %d citation blocks", len(citations))
+
     state["citations"] = citations
     context_text = "\n\n".join(context_blocks)
     system_prompt = (
@@ -122,6 +137,7 @@ def auditor_node(state: AgentState) -> AgentState:
     generated_answer = call_llm(system_prompt, user_prompt)
     if generated_answer and generated_answer.strip():
         state["answer"] = generated_answer.strip()
+        logger.info("auditor_node: LLM returned an answer (len=%d)", len(state["answer"]))
         return state
 
     best = docs[0]
